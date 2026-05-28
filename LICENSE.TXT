@@ -1,70 +1,204 @@
-==============================================================================
-LLVM Release License
-==============================================================================
-University of Illinois/NCSA
-Open Source License
+import torch
+import torch.nn as nn
+import triton
+import triton.language as tl
+import torch_npu
 
-Copyright (c) 2003-2014 University of Illinois at Urbana-Champaign.
-All rights reserved.
 
-Developed by:
+# Kernel 1: No broadcast (element-wise 1D)
+@triton.jit
+def add_no_broadcast_kernel(x_ptr, y_ptr, out_ptr, n_elements, alpha, num_cores: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    blocks_per_core = tl.cdiv(num_blocks, num_cores)
+    start_block = pid * blocks_per_core
+    end_block = start_block + blocks_per_core
+    if end_block > num_blocks:
+        end_block = num_blocks
 
-    LLVM Team
+    for block_idx in range(start_block, end_block, 1):
+        offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
-    University of Illinois at Urbana-Champaign
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+        out = x + alpha * y
 
-    http://llvm.org
+        tl.store(out_ptr + offsets, out, mask=mask)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the "Software"), to deal with
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
 
-    * Redistributions of source code must retain the above copyright notice,
-      this list of conditions and the following disclaimers.
+# Kernel 2: 2D broadcast dim1 (y broadcasts on dim1, e.g., y=[M,1])
+@triton.jit
+def add_broadcast_2d_dim1_kernel(x_ptr, y_ptr, out_ptr, M, N, alpha, num_cores: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid = tl.program_id(0)
+    num_blocks_m = tl.cdiv(M, BLOCK_M)
+    num_blocks_n = tl.cdiv(N, BLOCK_N)
+    num_blocks = num_blocks_m * num_blocks_n
+    blocks_per_core = tl.cdiv(num_blocks, num_cores)
+    start_block = pid * blocks_per_core
+    end_block = start_block + blocks_per_core
+    if end_block > num_blocks:
+        end_block = num_blocks
 
-    * Redistributions in binary form must reproduce the above copyright notice,
-      this list of conditions and the following disclaimers in the
-      documentation and/or other materials provided with the distribution.
+    for block_idx in range(start_block, end_block, 1):
+        bm = block_idx // num_blocks_n
+        bn = block_idx % num_blocks_n
+        row_offs = bm * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_offs = bn * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = row_offs < M
+        col_mask = col_offs < N
+        mask_2d = row_mask[:, None] & col_mask[None, :]
 
-    * Neither the names of the LLVM Team, University of Illinois at
-      Urbana-Champaign, nor the names of its contributors may be used to
-      endorse or promote products derived from this Software without specific
-      prior written permission.
+        x = tl.load(x_ptr + row_offs[:, None] * N + col_offs[None, :], mask=mask_2d, other=0.0)
+        y = tl.load(y_ptr + row_offs[:, None], mask=row_mask[:, None], other=0.0)
+        out = x + alpha * y
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
-CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
-SOFTWARE.
+        tl.store(out_ptr + row_offs[:, None] * N + col_offs[None, :], out, mask=mask_2d)
 
-==============================================================================
-Copyrights and Licenses for Third Party Software Distributed with LLVM:
-==============================================================================
-The LLVM software contains code written by third parties.  Such software will
-have its own individual LICENSE.TXT file in the directory in which it appears.
-This file will describe the copyrights, license, and restrictions which apply
-to that code.
 
-The disclaimer of warranty in the University of Illinois Open Source License
-applies to all code in the LLVM Distribution, and nothing in any of the
-other licenses gives permission to use the names of the LLVM Team or the
-University of Illinois to endorse or promote products derived from this
-Software.
+# Kernel 3: 2D broadcast dim0 (y broadcasts on dim0, e.g., y=[1,N])
+@triton.jit
+def add_broadcast_2d_dim0_kernel(x_ptr, y_ptr, out_ptr, M, N, alpha, num_cores: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    pid = tl.program_id(0)
+    num_blocks_m = tl.cdiv(M, BLOCK_M)
+    num_blocks_n = tl.cdiv(N, BLOCK_N)
+    num_blocks = num_blocks_m * num_blocks_n
+    blocks_per_core = tl.cdiv(num_blocks, num_cores)
+    start_block = pid * blocks_per_core
+    end_block = start_block + blocks_per_core
+    if end_block > num_blocks:
+        end_block = num_blocks
 
-The following pieces of software have additional or alternate copyrights,
-licenses, and/or restrictions:
+    for block_idx in range(start_block, end_block, 1):
+        bm = block_idx // num_blocks_n
+        bn = block_idx % num_blocks_n
+        row_offs = bm * BLOCK_M + tl.arange(0, BLOCK_M)
+        col_offs = bn * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = row_offs < M
+        col_mask = col_offs < N
+        mask_2d = row_mask[:, None] & col_mask[None, :]
 
-Program             Directory
--------             ---------
-Autoconf            llvm/autoconf
-                    llvm/projects/ModuleMaker/autoconf
-Google Test         llvm/utils/unittest/googletest
-OpenBSD regex       llvm/lib/Support/{reg*, COPYRIGHT.regex}
-pyyaml tests        llvm/test/YAMLParser/{*.data, LICENSE.TXT}
-ARM contributions   llvm/lib/Target/ARM/LICENSE.TXT
-md5 contributions   llvm/lib/Support/MD5.cpp llvm/include/llvm/Support/MD5.h
+        x = tl.load(x_ptr + row_offs[:, None] * N + col_offs[None, :], mask=mask_2d, other=0.0)
+        y = tl.load(y_ptr + col_offs, mask=col_mask, other=0.0)
+        out = x + alpha * y
+
+        tl.store(out_ptr + row_offs[:, None] * N + col_offs[None, :], out, mask=mask_2d)
+
+
+# Kernel 4: Generic 1D broadcast (for 3D/4D, expand + contiguous in host)
+@triton.jit
+def add_broadcast_1d_kernel(x_ptr, y_ptr, out_ptr, n_elements, alpha, num_cores: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    blocks_per_core = tl.cdiv(num_blocks, num_cores)
+    start_block = pid * blocks_per_core
+    end_block = start_block + blocks_per_core
+    if end_block > num_blocks:
+        end_block = num_blocks
+
+    for block_idx in range(start_block, end_block, 1):
+        offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+        out = x + alpha * y
+
+        tl.store(out_ptr + offsets, out, mask=mask)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        try:
+            self.VEC_CORE_NUM = torch_npu.npu.npu_config.get_device_limit(0).get("vector_core_num", 40)
+        except Exception:
+            self.VEC_CORE_NUM = 40
+
+    def _get_broadcast_info(self, x_shape, y_shape):
+        if x_shape == y_shape:
+            return len(x_shape), [], False
+
+        max_ndim = max(len(x_shape), len(y_shape))
+        x_padded = [1] * (max_ndim - len(x_shape)) + list(x_shape)
+        y_padded = [1] * (max_ndim - len(y_shape)) + list(y_shape)
+
+        out_shape = []
+        broadcast_dims = []
+        for i in range(max_ndim):
+            if x_padded[i] == y_padded[i]:
+                out_shape.append(x_padded[i])
+            elif x_padded[i] == 1:
+                out_shape.append(y_padded[i])
+            elif y_padded[i] == 1:
+                out_shape.append(x_padded[i])
+                broadcast_dims.append(i)
+            else:
+                raise ValueError(f"Incompatible shapes: {x_shape}, {y_shape}")
+
+        return len(out_shape), tuple(broadcast_dims), True
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        out_ndim, broadcast_dims, is_broadcast = self._get_broadcast_info(x.shape, y.shape)
+
+        if not is_broadcast:
+            # No broadcast path
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if not y.is_contiguous():
+                y = y.contiguous()
+            output = torch.empty_like(x)
+            n_elements = x.numel()
+            BLOCK_SIZE = 8192
+            num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+            grid_size = min(num_blocks, self.VEC_CORE_NUM)
+            grid = (grid_size,)
+            add_no_broadcast_kernel[grid](x, y, output, n_elements, alpha, self.VEC_CORE_NUM, BLOCK_SIZE)
+            return output
+
+        # Broadcast routing
+        key = (out_ndim, broadcast_dims)
+
+        if key == (2, (1,)):
+            # 2D broadcast dim1
+            output = torch.empty_like(x)
+            M, N = x.shape
+            BLOCK_M = 8
+            BLOCK_N = 1024
+            num_blocks_m = triton.cdiv(M, BLOCK_M)
+            num_blocks_n = triton.cdiv(N, BLOCK_N)
+            num_blocks = num_blocks_m * num_blocks_n
+            grid_size = min(num_blocks, self.VEC_CORE_NUM)
+            grid = (grid_size,)
+            add_broadcast_2d_dim1_kernel[grid](x, y, output, M, N, alpha, self.VEC_CORE_NUM, BLOCK_M, BLOCK_N)
+            return output
+
+        elif key == (2, (0,)):
+            # 2D broadcast dim0
+            output = torch.empty_like(x)
+            M, N = x.shape
+            BLOCK_M = 8
+            BLOCK_N = 1024
+            num_blocks_m = triton.cdiv(M, BLOCK_M)
+            num_blocks_n = triton.cdiv(N, BLOCK_N)
+            num_blocks = num_blocks_m * num_blocks_n
+            grid_size = min(num_blocks, self.VEC_CORE_NUM)
+            grid = (grid_size,)
+            add_broadcast_2d_dim0_kernel[grid](x, y, output, M, N, alpha, self.VEC_CORE_NUM, BLOCK_M, BLOCK_N)
+            return output
+
+        else:
+            # Generic 3D/4D broadcast: expand + 1D kernel
+            out_shape = torch.broadcast_shapes(x.shape, y.shape)
+            x_expanded = x.expand(out_shape).contiguous().view(-1)
+            y_expanded = y.expand(out_shape).contiguous().view(-1)
+            output = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+            out_flat = output.view(-1)
+
+            n_elements = out_flat.numel()
+            BLOCK_SIZE = 8192
+            num_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+            grid_size = min(num_blocks, self.VEC_CORE_NUM)
+            grid = (grid_size,)
+            add_broadcast_1d_kernel[grid](x_expanded, y_expanded, out_flat, n_elements, alpha, self.VEC_CORE_NUM, BLOCK_SIZE)
+            return output
