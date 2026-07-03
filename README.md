@@ -735,3 +735,461 @@ SASS verification
 ```text
 profiling 证据驱动的闭环搜索
 ```
+
+# `ncu_top.json` 和 `roofline.json` 是怎么生成的
+
+在 `cuda-optimized-skill` 中，下面两个文件都是由脚本自动生成的，而不是 LLM 手写出来的：
+
+```text
+iterv1/ncu_top.json
+iterv1/roofline.json
+```
+
+它们的生成关系可以概括为：
+
+```text
+best_input.ncu-rep
+    ↓ profile_ncu.py
+ncu_top.json
+    ↓ roofline.py
+roofline.json
+```
+
+也就是说：
+
+```text
+.ncu-rep:
+    原始完整 Nsight Compute profiling 数据
+
+ncu_top.json:
+    从 .ncu-rep 中提取出的关键指标摘要
+
+roofline.json:
+    根据 ncu_top.json 进一步计算出的优化决策信号
+```
+
+---
+
+## 1. `ncu_top.json` 怎么生成
+
+`ncu_top.json` 由脚本生成：
+
+```bash
+scripts/profile_ncu.py
+```
+
+典型运行方式是：
+
+```bash
+python scripts/profile_ncu.py \
+  --state ./run_*/state.json \
+  --iter 1 \
+  --which best_input
+```
+
+它的流程如下：
+
+```text
+读取 state.json
+    ↓
+找到当前 best kernel
+    ↓
+调用 ncu --set full 跑 Nsight Compute
+    ↓
+生成 best_input.ncu-rep
+    ↓
+使用 ncu --import 将 .ncu-rep 导出成 CSV
+    ↓
+解析 CSV 中的 metrics
+    ↓
+按照规则把 metrics 分成 compute / memory / latency 三类
+    ↓
+每类选择 top-K 最关键指标
+    ↓
+写出 ncu_top.json
+```
+
+---
+
+## 2. `profile_ncu.py` 具体做了什么
+
+`profile_ncu.py` 的核心作用是：
+
+```text
+完整 NCU profile
+    → CSV metrics
+    → 指标分类
+    → 严重程度排序
+    → top-K 指标摘要
+```
+
+它会把指标分成三类。
+
+### 2.1 Compute 轴
+
+关注计算资源是否被充分利用，例如：
+
+```text
+Tensor Core utilization
+FP32 / FP64 pipe utilization
+IPC
+occupancy
+SM throughput
+```
+
+### 2.2 Memory 轴
+
+关注访存是否高效，例如：
+
+```text
+DRAM throughput
+DRAM bytes
+L1 / L2 hit rate
+shared memory bank conflicts
+L1 / L2 throughput
+```
+
+### 2.3 Latency 轴
+
+关注 stall 和等待，例如：
+
+```text
+long scoreboard stall
+short scoreboard stall
+barrier stall
+mio throttle
+lg throttle
+wait stall
+```
+
+最终生成的 `ncu_top.json` 可以理解成：
+
+```json
+{
+  "compute": [
+    {
+      "name": "sm__pipe_tensor_op_hmma_cycles_active...",
+      "value": 12.3
+    },
+    {
+      "name": "sm__warps_active...",
+      "value": 18.0
+    }
+  ],
+  "memory": [
+    {
+      "name": "dram__throughput...",
+      "value": 35.2
+    },
+    {
+      "name": "l1tex__t_sector_hit_rate.pct",
+      "value": 22.1
+    }
+  ],
+  "latency": [
+    {
+      "name": "smsp__warp_issue_stalled_long_scoreboard...",
+      "value": 41.0
+    }
+  ]
+}
+```
+
+这里的 `ncu_top.json` 不是完整 profile，而是给 LLM 和后续脚本使用的 profiling 摘要。
+
+---
+
+## 3. `roofline.json` 怎么生成
+
+`roofline.json` 由另一个脚本生成：
+
+```bash
+scripts/roofline.py
+```
+
+典型运行方式是：
+
+```bash
+python scripts/roofline.py \
+  --state ./run_*/state.json \
+  --iter 1
+```
+
+它读取：
+
+```text
+iterv1/ncu_top.json
+env.json / state.json 中的硬件环境信息
+```
+
+然后计算三个 gap：
+
+```text
+Δc = delta_compute
+Δm = delta_memory
+Δl = delta_latency
+```
+
+---
+
+## 4. `roofline.py` 的核心计算逻辑
+
+`roofline.py` 会把 `ncu_top.json` 中的指标进一步压缩成三个优化方向的 gap。
+
+### 4.1 Compute gap
+
+粗略可以理解为：
+
+```python
+compute_util = max(
+    tensor_core_utilization,
+    fp32_pipe_utilization,
+    sm_throughput
+)
+
+delta_compute = 1 - compute_util
+```
+
+含义是：
+
+```text
+compute utilization 越低，delta_compute 越大；
+delta_compute 越大，说明计算资源利用越不充分。
+```
+
+---
+
+### 4.2 Memory gap
+
+粗略可以理解为：
+
+```python
+memory_util = dram_throughput_pct
+delta_memory = 1 - memory_util
+```
+
+含义是：
+
+```text
+memory bandwidth utilization 越低，delta_memory 越大；
+delta_memory 越大，说明访存带宽利用不足或存在访存瓶颈。
+```
+
+---
+
+### 4.3 Latency gap
+
+粗略可以理解为：
+
+```python
+delta_latency = max(stall_percentage_metrics)
+```
+
+它会关注一些 stall 指标，例如：
+
+```text
+long scoreboard stall
+short scoreboard stall
+barrier stall
+mio throttle
+lg throttle
+wait stall
+```
+
+含义是：
+
+```text
+stall 百分比越高，delta_latency 越大；
+delta_latency 越大，说明 kernel 中有较严重的等待或延迟问题。
+```
+
+---
+
+## 5. `roofline.json` 中会包含什么
+
+`roofline.json` 通常会包含：
+
+```json
+{
+  "delta_compute": 0.85,
+  "delta_memory": 0.60,
+  "delta_latency": 0.55,
+  "bound": "compute",
+  "near_peak": false,
+  "axis_budget": {
+    "compute": 1,
+    "memory": 1,
+    "latency": 1
+  }
+}
+```
+
+这些字段的含义是：
+
+| 字段              | 含义                     |
+| --------------- | ---------------------- |
+| `delta_compute` | 计算资源利用 gap             |
+| `delta_memory`  | 访存带宽利用 gap             |
+| `delta_latency` | stall / latency gap    |
+| `bound`         | 当前主要瓶颈方向               |
+| `near_peak`     | 是否已经接近硬件峰值             |
+| `axis_budget`   | 下一轮每个优化轴可以选择多少个 method |
+
+---
+
+## 6. 如何判断主要瓶颈
+
+可以简单理解为：
+
+```text
+如果 delta_compute 最大
+    → compute-bound
+
+如果 delta_memory 最大
+    → bandwidth-bound / memory-bound
+
+如果 delta_latency 最大
+    → latency-bound
+
+如果三个 gap 都很小
+    → near_peak = true
+```
+
+例如：
+
+```json
+{
+  "delta_compute": 0.92,
+  "delta_memory": 0.57,
+  "delta_latency": 0.61,
+  "bound": "compute",
+  "near_peak": false
+}
+```
+
+表示：
+
+```text
+compute gap 最大；
+当前 kernel 主要问题是计算资源利用率低；
+下一轮应该优先尝试 compute 相关优化。
+```
+
+---
+
+## 7. 如何分配 axis budget
+
+`roofline.py` 会根据三个 gap 分配下一轮优化预算。
+
+可以理解为：
+
+```text
+总 budget = 3
+单个 axis 最多 = 2
+gap 太小的 axis 分配 0
+按照 delta_compute / delta_memory / delta_latency 的相对大小分配预算
+```
+
+例如：
+
+```json
+{
+  "delta_compute": 0.20,
+  "delta_memory": 0.75,
+  "delta_latency": 0.55,
+  "axis_budget": {
+    "compute": 0,
+    "memory": 2,
+    "latency": 1
+  }
+}
+```
+
+表示：
+
+```text
+memory gap 最大，因此 memory 轴分配 2 个 method；
+latency gap 次之，因此 latency 轴分配 1 个 method；
+compute gap 较小，因此 compute 轴暂时不分配 method。
+```
+
+---
+
+## 8. 两个文件的作用区别
+
+| 文件                   | 来源               | 作用                |
+| -------------------- | ---------------- | ----------------- |
+| `best_input.ncu-rep` | Nsight Compute   | 保存完整 profiling 结果 |
+| `ncu_top.json`       | `profile_ncu.py` | 从 NCU 结果中提取关键指标   |
+| `roofline.json`      | `roofline.py`    | 根据关键指标计算优化方向和预算   |
+
+可以进一步理解为：
+
+```text
+best_input.ncu-rep:
+    原始数据层
+
+ncu_top.json:
+    profiling 摘要层
+
+roofline.json:
+    优化决策层
+```
+
+---
+
+## 9. 程序化总结
+
+整个过程可以写成：
+
+```python
+# 1. 跑 Nsight Compute，得到完整 profile
+ncu_rep = run_nsight_compute(best_kernel)
+
+# 2. 从完整 profile 中提取关键指标
+ncu_top = extract_top_metrics(
+    ncu_rep,
+    axes=["compute", "memory", "latency"]
+)
+
+# 3. 根据关键指标计算 roofline gap
+roofline = compute_roofline_gaps(
+    ncu_top=ncu_top,
+    env_info=env
+)
+
+# 4. 根据 gap 分配优化预算
+axis_budget = allocate_method_budget(
+    delta_compute=roofline["delta_compute"],
+    delta_memory=roofline["delta_memory"],
+    delta_latency=roofline["delta_latency"]
+)
+```
+
+---
+
+## 10. 最终总结
+
+这两个文件的生成逻辑可以一句话概括：
+
+```text
+profile_ncu.py 负责把完整 NCU profile 压缩成 ncu_top.json；
+roofline.py 负责把 ncu_top.json 转换成 roofline.json，用来指导下一轮优化。
+```
+
+也就是说：
+
+```text
+profiling 原始数据
+    ↓
+关键指标摘要
+    ↓
+compute / memory / latency gap
+    ↓
+axis budget
+    ↓
+method selection
+    ↓
+LLM code generation
+```
+
