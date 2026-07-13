@@ -1,1195 +1,873 @@
-# cuda-optimized-skill 中 Profiling 的使用方式
-
-## 1. 核心思想
-
-`cuda-optimized-skill` 不是简单地把 Nsight Compute 的 profile dump 交给 LLM，而是把 profiling 结果转化为一个结构化的优化控制信号。
-
-它的核心流程是：
-
-```text
-当前 best kernel
-    ↓
-Nsight Compute full profile
-    ↓
-抽取 compute / memory / latency 三类关键指标
-    ↓
-计算 roofline gap：Δc / Δm / Δl
-    ↓
-根据 gap 分配优化预算
-    ↓
-选择具体优化方法
-    ↓
-LLM 生成多个候选 kernel
-    ↓
-benchmark 选择 champion
-    ↓
-再次 profile champion
-    ↓
-ablation + SASS 验证
-    ↓
-更新 state，进入下一轮
-```
-
-一句话概括：
-
-```text
-profiling 不是结果展示工具，而是优化搜索的控制信号。
-```
-
----
-
-## 2. 每轮首先 profile 当前 best kernel
-
-每一轮开始时，skill 会对当前最快的 kernel 运行 Nsight Compute。
-
-示例命令：
-
-```bash
-python scripts/profile_ncu.py \
-  --state ./run_*/state.json \
-  --iter 1 \
-  --which best_input
-```
-
-该步骤会生成：
-
-```text
-iterv1/best_input.ncu-rep   # 完整 Nsight Compute 报告
-iterv1/ncu_top.json         # 给 LLM 使用的摘要指标
-```
-
-这里的关键点是：
-LLM 通常不会直接读取完整 `.ncu-rep`，而是读取压缩后的 `ncu_top.json`。
-
----
-
-## 3. profile_ncu.py：把海量指标压缩成三类 top-K
-
-`profile_ncu.py` 会执行：
-
-```text
-ncu --set full
-    ↓
-导出 raw CSV
-    ↓
-解析 metric
-    ↓
-按规则归类到 compute / memory / latency
-    ↓
-每类选出 top-K 严重指标
-    ↓
-写入 ncu_top.json
-```
-
-指标会被分成三类：
-
-### 3.1 Compute 轴
-
-关注计算资源是否被充分利用，例如：
-
-```text
-Tensor Core utilization
-FP32 / FP64 pipe utilization
-IPC
-occupancy
-SM throughput
-```
-
-### 3.2 Memory 轴
-
-关注访存是否高效，例如：
-
-```text
-DRAM throughput
-DRAM bytes
-L1 / L2 hit rate
-shared memory bank conflicts
-L1 / L2 throughput
-```
-
-### 3.3 Latency 轴
-
-关注 stall 和等待，例如：
-
-```text
-long scoreboard stall
-short scoreboard stall
-barrier stall
-mio throttle
-lg throttle
-wait stall
-```
-
-最终 `ncu_top.json` 大致可以理解成：
-
-```json
-{
-  "compute": [
-    {
-      "name": "sm__pipe_tensor_op_hmma_cycles_active...",
-      "value": 12.3
-    },
-    {
-      "name": "sm__warps_active...",
-      "value": 18.0
-    }
-  ],
-  "memory": [
-    {
-      "name": "dram__throughput...",
-      "value": 35.2
-    },
-    {
-      "name": "l1tex__t_sector_hit_rate.pct",
-      "value": 22.1
-    }
-  ],
-  "latency": [
-    {
-      "name": "smsp__warp_issue_stalled_long_scoreboard...",
-      "value": 41.0
-    }
-  ]
-}
-```
-
-也就是说，profiling 数据被转换成了 LLM 更容易使用的性能证据。
-
----
-
-## 4. roofline.py：把 profiling 指标变成三个 gap
-
-接下来，`roofline.py` 会读取：
-
-```text
-ncu_top.json
-env.json
-```
-
-然后计算三个 gap：
-
-```text
-Δc = compute utilization gap
-Δm = memory bandwidth utilization gap
-Δl = latency / stall gap
-```
-
-可以粗略理解为：
-
-```python
-delta_compute = 1 - compute_utilization
-delta_memory  = 1 - memory_bandwidth_utilization
-delta_latency = max_stall_percentage
-```
-
-输出大致类似：
-
-```json
-{
-  "delta_compute": 0.85,
-  "delta_memory": 0.60,
-  "delta_latency": 0.55,
-  "bound": "compute",
-  "near_peak": false,
-  "axis_budget": {
-    "compute": 1,
-    "memory": 1,
-    "latency": 1
-  }
-}
-```
-
-如果三个 gap 都很小，例如都小于阈值，就认为 kernel 已经接近硬件峰值，可以提前停止优化。
-
----
-
-## 5. profiling 决定优化预算
-
-这个 skill 每轮不会无限制地尝试优化方法，而是根据 profiling 结果分配优化预算。
-
-例如：
-
-```json
-{
-  "delta_compute": 0.20,
-  "delta_memory": 0.75,
-  "delta_latency": 0.55,
-  "axis_budget": {
-    "compute": 0,
-    "memory": 2,
-    "latency": 1
-  }
-}
-```
-
-这表示：
-
-```text
-当前主要问题在 memory 轴；
-其次是 latency 轴；
-compute 轴暂时不是主要优化方向。
-```
-
-因此下一轮会优先尝试：
-
-```text
-2 个 memory 优化方法
-1 个 latency 优化方法
-0 个 compute 优化方法
-```
-
-这一步的作用是减少搜索空间，避免 LLM 随机尝试不相关优化。
-
----
-
-## 6. profiling 触发具体优化方法
-
-有了 axis budget 后，LLM 会根据 profiling 指标选择具体优化方法。
-
-它会参考：
-
-```text
-references/optimization_catalog.md
-references/ncu_metrics_guide.md
-```
-
-这两个文件负责把指标映射到优化动作。
-
----
-
-## 7. 指标到优化方法的映射示例
-
-### 7.1 Long Scoreboard Stall 高
-
-```text
-smsp__warp_issue_stalled_long_scoreboard 高
-        ↓
-global memory latency 暴露
-        ↓
-可能触发 latency.async_pipeline / memory.async_copy
-        ↓
-尝试 cp.async、prefetch、double buffering、multi-stage pipeline
-```
-
-### 7.2 L1 Hit Rate 低
-
-```text
-l1tex__t_sector_hit_rate.pct 低
-        ↓
-访存局部性或合并访问较差
-        ↓
-可能触发 memory.coalesced_access
-        ↓
-调整 thread mapping、数据布局或访问顺序
-```
-
-### 7.3 Bank Conflict 高
-
-```text
-shared memory bank conflict 高
-        ↓
-shared memory 访问冲突
-        ↓
-触发 memory.bank_conflict
-        ↓
-调整 shared memory layout、padding 或访问模式
-```
-
-### 7.4 Barrier Stall 高
-
-```text
-barrier stall 高
-        ↓
-同步开销过大
-        ↓
-触发 latency.reduce_sync_count
-        ↓
-减少不必要的 __syncthreads()
-```
-
-### 7.5 Tensor Core 利用率低
-
-```text
-Tensor Core utilization 低
-        ↓
-计算资源没有充分使用
-        ↓
-触发 compute.tensor_core
-        ↓
-尝试 MMA / WMMA / CUTLASS / Tensor Core 路径
-```
-
----
-
-## 8. profiling 不直接生成代码，而是约束代码生成
-
-LLM 不是直接根据所有 ncu 指标自由发挥，而是根据 profiling 结果选出的优化方法生成候选代码。
-
-例如本轮选中的方法是：
-
-```json
-{
-  "methods": [
-    "memory.coalesced_access",
-    "memory.vectorized_access",
-    "latency.async_pipeline"
-  ]
-}
-```
-
-那么 LLM 生成的候选 kernel 就应该围绕这些方向展开。
-
-每一轮会生成多个 branch：
-
-```text
-branch_0
-branch_1
-branch_2
-branch_3
-```
-
-这些 branch 使用相同的优化方法，但可以改变实现细节，例如：
-
-```text
-tile size
-num warps
-pipeline stages
-vector width
-swizzle strategy
-implementation variant
-```
-
-然后通过 benchmark 选择最快且正确的 champion。
-
-所以这里 profiling 和 benchmark 的分工是：
-
-```text
-profiling 决定“应该尝试什么优化方向”
-benchmark 决定“哪个候选实现真的最快”
-```
-
----
-
-## 9. 优化后再次 profile champion
-
-选出 champion 后，skill 会再次运行 Nsight Compute：
-
-```bash
-python scripts/profile_ncu.py \
-  --state ./run_*/state.json \
-  --iter 1 \
-  --which kernel
-```
-
-生成：
-
-```text
-iterv1/kernel.ncu-rep
-```
-
-这一步用于观察优化后的瓶颈变化，例如：
-
-```text
-compute gap 是否下降？
-memory gap 是否下降？
-latency stall 是否下降？
-瓶颈是否从 memory 转移到 compute？
-是否出现新的 stall？
-```
-
-也就是说，profiling 不只用于第一轮分析，而是每轮都会更新优化方向。
-
----
-
-## 10. profiling 历史进入 state
-
-每轮结束后，profiling 相关结果会被写入 `state.json`。
-
-其中会记录：
-
-```text
-roofline_history
-selected_methods
-effective_methods
-ineffective_methods
-implementation_failed_methods
-frontier
-```
-
-例如：
-
-```json
-{
-  "iter": 1,
-  "delta_compute": 0.85,
-  "delta_memory": 0.60,
-  "delta_latency": 0.55,
-  "bound": "compute",
-  "axis_budget": {
-    "compute": 1,
-    "memory": 1,
-    "latency": 1
-  }
-}
-```
-
-这样下一轮可以知道：
-
-```text
-哪些方法已经试过？
-哪些方法有效？
-哪些方法无效？
-哪些方法实现失败？
-当前瓶颈是否发生漂移？
-```
-
-例如：
-
-```text
-iter1: memory-bound
-iter2: latency-bound
-iter3: compute-bound
-```
-
-这就是所谓的 bottleneck drift。
-
----
-
-## 11. Ablation：判断优化方法是否真的有效
-
-选出 champion 后，skill 还会做 ablation。
-
-做法是：
-从 champion 中移除某个优化方法，然后重新 benchmark。
-
-例如：
-
-```text
-champion
-  - remove memory.coalesced_access
-  - remove latency.async_pipeline
-  - remove compute.launch_config
-```
-
-然后计算：
-
-```text
-attribution(method) = runtime_without_method - runtime_champion
-```
-
-如果：
-
-```text
-runtime_without_method > runtime_champion
-```
-
-说明去掉该方法后变慢，该方法有正贡献。
-
-如果：
-
-```text
-runtime_without_method ≈ runtime_champion
-```
-
-说明该方法贡献很小。
-
-如果：
-
-```text
-runtime_without_method < runtime_champion
-```
-
-说明该方法可能是负优化。
-
-Ablation 的作用是防止 LLM 误判优化来源。
-
-例如，LLM 可能声称性能提升来自 `async_pipeline`，但实际提升可能只是因为 tile size 变了。Ablation 可以把这些贡献拆开。
-
----
-
-## 12. SASS 验证：确认优化是否真的编进机器码
-
-除了 ablation，它还会做 SASS verification。
-
-流程是：
-
-```bash
-cuobjdump --dump-sass
-```
-
-然后检查机器码中是否出现预期指令模式。
-
-例如：
-
-```text
-compute.tensor_core
-    → 期望看到 HMMA / WGMMA / UMMA
-
-memory.vectorized_access
-    → 期望看到向量化 load/store
-
-warp specialization
-    → 期望看到 SETMAXREG 等相关模式
-```
-
-这一步解决的问题是：
-
-```text
-源码里看起来写了某个优化，
-但编译器可能没有真的生成对应机器码。
-```
-
-因此最终会根据：
-
-```text
-SASS 是否验证通过
-Ablation 贡献是否超过噪声阈值
-```
-
-把方法分为三类：
-
-```text
-effective_methods
-ineffective_methods
-implementation_failed_methods
-```
-
-分类逻辑可以表示为：
-
-```text
-SASS verified + attribution > noise
-    → effective_methods
-
-SASS verified + attribution <= noise
-    → ineffective_methods
-
-SASS not verified
-    → implementation_failed_methods
-```
-
----
-
-## 13. 程序化总结
-
-整个 profiling-guided loop 可以写成：
-
-```python
-for iter in range(max_iters):
-    # 1. Profile 当前 best kernel
-    profile = ncu_profile(best_kernel)
-
-    # 2. 抽取三类关键指标
-    ncu_top = extract_top_metrics(
-        profile,
-        axes=["compute", "memory", "latency"]
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+
+import torch
+import triton
+import triton.language as tl
+
+from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from fla.ops.cp import FLACPContext
+from fla.ops.cp.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu_pre_process,
+    expand_h0,
+)
+from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra
+from fla.ops.kda.gate import kda_gate_bwd, kda_gate_chunk_cumsum
+from fla.ops.kda.wy_fast import recompute_w_u_fwd
+from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.op import exp2
+from fla.utils import (
+    IS_NVIDIA_HOPPER,
+    autotune_cache_kwargs,
+    check_shared_mem,
+)
+
+BK_LIST = [64] if check_shared_mem() else [32]
+BV_LIST = [64] if check_shared_mem('ampere') else [32]
+NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2]
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+#         for num_warps in NUM_WARPS
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
+#     **autotune_cache_kwargs,
+# )
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=2, num_stages=2)],
+    key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_kda_bwd_kernel_dAv(
+    q,
+    k,
+    v,
+    A,
+    do,
+    dv,
+    dA,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    # offset calculation
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    do += (bos * H + i_h) * V
+    dv += (bos * H + i_h) * V
+    dA += (bos * H + i_h) * BT
+
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
+    b_A = tl.load(p_A, boundary_check=(0, 1))
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
+    b_A = tl.where(m_A, b_A, 0).to(do.dtype.element_ty)
+
+    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
+    for i_v in range(tl.cdiv(V, BV)):
+        p_v = tl.make_block_ptr(v, (V, T), (1, H*V), (i_v * BV, i_t * BT), (BV, BT), (0, 1))
+        p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_dv = tl.make_block_ptr(dv, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        # [BV, BT]
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        # [BT, BV]
+        b_do = tl.load(p_do, boundary_check=(0, 1))
+        # [BT, BT]
+        b_dA += tl.dot(b_do, b_v)
+        # [BT, BV]
+        b_dv = tl.dot(b_A.to(b_do.dtype), b_do)
+        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
+
+    p_dA = tl.make_block_ptr(dA, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_dA = tl.where(o_t[:, None] >= o_t, b_dA * scale, 0.)
+    tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+#         for BK in BK_LIST
+#         for BV in BV_LIST
+#         for num_warps in NUM_WARPS
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=['BT', 'TRANSPOSE_STATE'],
+#     **autotune_cache_kwargs,
+# )
+@triton.autotune(
+    configs=[triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3)],
+    key=['BT', 'TRANSPOSE_STATE'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def chunk_kda_bwd_kernel_wy_dqkg_fused(
+    q,
+    k,
+    v,
+    v_new,
+    g,
+    beta,
+    A,
+    h,
+    do,
+    dh,
+    dq,
+    dk,
+    dv,
+    dv2,
+    dg,
+    db,
+    dA,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    T,
+    scalar,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_tg = i_t.to(tl.int64)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        NT = tl.cdiv(T, BT)
+        i_tg = (i_b * NT + i_t).to(tl.int64)
+        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    m_last = (o_t == min(T, i_t * BT + BT) - 1)
+
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    v_new += (bos * H + i_h) * V
+    g += (bos * H + i_h) * K
+    beta += bos * H + i_h
+    A += (bos * H + i_h) * BT
+    h += (i_tg * H + i_h) * K*V
+    do += (bos * H + i_h) * V
+    dh += (i_tg * H + i_h) * K*V
+    dq += (bos * H + i_h) * K
+    dk += (bos * H + i_h) * K
+    dv += (bos * H + i_h) * V
+    dv2 += (bos * H + i_h) * V
+    dg += (bos * H + i_h) * K
+    db += bos * H + i_h
+    dA += (bos * H + i_h) * BT
+
+    BT_arange = i_t * BT + tl.arange(0, BT)
+    BT_arange_zero_offset = tl.arange(0, BT)
+    BT_mask = (BT_arange < T) & (BT_arange >= 0)
+    BT_mask_zero_offset = (BT_arange_zero_offset < BT) & (BT_arange_zero_offset >= 0)
+    p_beta = beta + BT_arange * H
+    b_beta = tl.load(p_beta, mask = BT_mask, other = 0.)
+    tl.extra.cann.extension.compile_hint(b_beta, "mayDiscretememaccess")
+
+    p_A = A + BT_arange_zero_offset[:, None] + H * BT * BT_arange
+    b_A = tl.load(p_A, mask = BT_mask_zero_offset[:, None] & BT_mask[None, :], other = 0.)
+    tl.extra.cann.extension.compile_hint(b_A, "mayDiscretememaccess")
+
+    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
+    b_db = tl.zeros([BT], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        BK_arange = i_k * BK + tl.arange(0, BK)
+        BK_mask = (BK_arange < K) & (BK_arange >= 0)
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+        b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+
+        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
+        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+        b_gn = tl.where(m_k, b_gn, 0)
+
+        b_dq = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dw = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dgk = tl.zeros([BK], dtype=tl.float32)
+
+        for i_v in range(tl.cdiv(V, BV)):
+            BV_arange = i_v * BV + tl.arange(0, BV)
+            BV_mask = (BV_arange < V) & (BV_arange >= 0)
+            p_v_new = v_new + BT_arange[:, None] * H*V + BV_arange
+            p_do = do + BT_arange[:, None] * H*V + BV_arange
+            if TRANSPOSE_STATE:
+                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+                p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+            else:
+                p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+                p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            p_dv = dv + BT_arange[:, None] * H*V + BV_arange
+            # [BT, BV]
+            b_v_new = tl.load(p_v_new, mask= BT_mask[:,None] & BV_mask[None, :])
+            tl.extra.cann.extension.compile_hint(b_v_new, "mayDiscretememaccess")
+            b_v_new = tl.where(BT_mask[:,None] & BV_mask[None, :], b_v_new, 0)
+            b_do = tl.load(p_do, mask= BT_mask[:,None] & BV_mask[None, :])
+            tl.extra.cann.extension.compile_hint(b_do, "mayDiscretememaccess")
+            b_do = tl.where(BT_mask[:,None] & BV_mask[None, :], b_do, 0)
+            # [BV, BK]
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            tl.extra.cann.extension.compile_hint(b_h, "mayDiscretememaccess")
+            b_dh = tl.load(p_dh, boundary_check=(0, 1))
+            tl.extra.cann.extension.compile_hint(b_dh, "mayDiscretememaccess")
+            # [BT, BV]
+            b_dv = tl.load(p_dv, mask= BT_mask[:,None] & BV_mask[None, :])
+            tl.extra.cann.extension.compile_hint(b_dv, "mayDiscretememaccess")
+
+            b_dgk += tl.sum(b_h * b_dh, axis=0)
+            b_dq += tl.dot(b_do, b_h.to(b_do.dtype)) * scalar
+            b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype)) * scalar
+            b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype)) * scalar
+            tl.debug_barrier()  # DO NOT REMOVE THIS LINE!
+            if i_k == 0:
+                p_v = v + BT_arange[:, None] * H*V + BV_arange
+                p_dv2_block = tl.make_block_ptr(dv2, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+
+                b_v = tl.load(p_v, mask = BT_mask[:, None] & BV_mask[None, :], other = 0.0)
+
+                b_dA += tl.dot(b_dv, tl.trans(b_v))  * scalar
+
+                b_dvb = tl.dot(b_A, b_dv)
+                b_dv2 = b_dvb * b_beta[:, None]
+                b_db += tl.sum(b_dvb * b_v, 1)
+                casted_b_dv2 = b_dv2.to(p_dv2_block.dtype.element_ty)
+                tl.store(p_dv2_block, casted_b_dv2, boundary_check=(0, 1))
+
+        b_gk_exp = exp2(b_g)
+        b_gb = b_gk_exp * b_beta[:, None]
+        b_dgk *= exp2(b_gn)
+        b_dq = b_dq * b_gk_exp * scale
+        b_dk = b_dk * tl.where(m_t[:, None], exp2(b_gn[None, :] - b_g), 0)
+
+        b_kg = b_k * b_gk_exp
+
+        b_dw = -b_dw.to(b_A.dtype)
+        b_dA += tl.dot(b_dw, tl.trans(b_kg.to(b_A.dtype))) * scalar
+
+        b_dkgb = tl.dot(b_A, b_dw)
+        b_db += tl.sum(b_dkgb * b_kg, 1)
+
+        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+        tl.extra.cann.extension.compile_hint(b_q, "mayDiscretememaccess")
+        b_kdk = b_k * b_dk
+        b_dgk += tl.sum(b_kdk, axis=0)
+        b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
+        b_dk = b_dk + b_dkgb * b_gb
+
+        p_dq_block = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk_block = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dg_block = tl.make_block_ptr(dg, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+
+        casted_b_dq = b_dq.to(p_dq_block.dtype.element_ty)
+        tl.store(p_dq_block, casted_b_dq, boundary_check=(0, 1))
+        casted_b_dk = b_dk.to(p_dk_block.dtype.element_ty)
+        tl.store(p_dk_block, casted_b_dk, boundary_check=(0, 1))
+        casted_b_dg = b_dg.to(p_dg_block.dtype.element_ty)
+        tl.store(p_dg_block, casted_b_dg, boundary_check=(0, 1))
+
+    m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
+    b_dA = tl.where(m_A, b_dA * b_beta[None, :], 0)
+    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
+    b_dA = tl.where(m_A, -b_dA, 0)
+
+    p_dA = tl.make_block_ptr(dA, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_db = tl.make_block_ptr(db, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    casted_b_dA = b_dA.to(p_dA.dtype.element_ty)
+    tl.extra.cann.extension.compile_hint(casted_b_dA, "mayDiscretememaccess")
+    tl.store(p_dA, casted_b_dA, boundary_check=(0, 1))
+    casted_b_db = b_db.to(p_db.dtype.element_ty)
+    tl.extra.cann.extension.compile_hint(casted_b_db, "mayDiscretememaccess")
+    tl.store(p_db, casted_b_db, boundary_check=(0,))
+
+@triton.autotune(
+    configs=[triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3)],
+    key=['BT', 'TRANSPOSE_STATE'],
+    **autotune_cache_kwargs,
+)
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit(do_not_specialize=['T', 'stride_hz'])
+def chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2(
+    q,              # [B, T, H, K]
+    k,              # [B, T, H, K]
+    v,              # [B, T, H, V]
+    v_new,          # [B, T, H, V]
+    g,              # [B, T, H, K]
+    beta,           # [B, T, H]
+    A,              # [B, T, H, BT]
+    h,              # [1, 128, H, K, V]
+    do,             # [B, T, H, V]
+    dh,             # [B, 128, H, K, V]
+    dq,             # [B, T, H, K]
+    dk,             # [B, T, H, K]
+    dv,             # [B, T, H, V], input
+    dv2,            # [B, T, H, V], output
+    dg,             # [B, T, H, K]
+    db,             # [B, T, H]
+    dA,             # [B, T, H, BT]
+    cu_seqlens,     # [4]
+    chunk_indices,  # [128, 2]
+    scale,          # float
+    T,              # int
+    scalar,         # float
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    stride_hz,      # int, = B*T (non-varlen) or total_len (varlen)
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_tg = i_t.to(tl.int64)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NT = tl.cdiv(T, BT)
+    else:
+        NT = tl.cdiv(T, BT)
+        i_tg = (i_b * NT + i_t).to(tl.int64)
+        bos, eos = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    m_last = (o_t == min(T, i_t * BT + BT) - 1)
+
+    q += (i_h * stride_hz + bos) * K
+    k += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    v_new += (i_h * stride_hz + bos) * V
+    g += (bos * H + i_h) * K
+    beta += i_h * stride_hz + bos
+    A += (i_h * stride_hz + bos) * BT
+    h += (i_tg * H + i_h) * K*V
+    do += (i_h * stride_hz + bos) * V
+    dh += (i_tg * H + i_h) * K*V
+    dq += (bos * H + i_h) * K
+    dk += (bos * H + i_h) * K
+    dv += (bos * H + i_h) * V
+    dv2 += (bos * H + i_h) * V
+    dg += (bos * H + i_h) * K
+    db += i_h * stride_hz + bos
+    dA += (i_h * stride_hz + bos) * BT
+
+    BT_arange = i_t * BT + tl.arange(0, BT)
+    BT_arange_zero_offset = tl.arange(0, BT)
+    BT_mask = (BT_arange < T) & (BT_arange >= 0)
+    BT_mask_zero_offset = (BT_arange_zero_offset < BT) & (BT_arange_zero_offset >= 0)
+    p_beta = beta + BT_arange
+    b_beta = tl.load(p_beta, mask = BT_mask, other = 0.)
+
+    p_A = A + BT_arange_zero_offset[:, None] + BT * BT_arange
+    b_A = tl.load(p_A, mask = BT_mask_zero_offset[:, None] & BT_mask[None, :], other = 0.)
+
+    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
+    b_db = tl.zeros([BT], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        BK_arange = i_k * BK + tl.arange(0, BK)
+        BK_mask = (BK_arange < K) & (BK_arange >= 0)
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_g = tl.make_block_ptr(g, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
+        b_g = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+
+        p_gn = g + (min(T, i_t * BT + BT) - 1).to(tl.int64) * H*K + o_k
+        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+        b_gn = tl.where(m_k, b_gn, 0)
+
+        b_dq = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dw = tl.zeros([BT, BK], dtype=tl.float32)
+        b_dgk = tl.zeros([BK], dtype=tl.float32)
+
+        for i_v in range(tl.cdiv(V, BV)):
+            BV_arange = i_v * BV + tl.arange(0, BV)
+            BV_mask = (BV_arange < V) & (BV_arange >= 0)
+            p_v_new = v_new + BT_arange[:, None] * V + BV_arange
+            p_do = do + BT_arange[:, None] * V + BV_arange
+            if TRANSPOSE_STATE:
+                p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+                p_dh = tl.make_block_ptr(dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
+            else:
+                p_h = tl.make_block_ptr(h, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+                p_dh = tl.make_block_ptr(dh, (V, K), (1, V), (i_v * BV, i_k * BK), (BV, BK), (0, 1))
+            p_dv = dv + BT_arange[:, None] * H*V + BV_arange
+            # [BT, BV]
+            b_v_new = tl.load(p_v_new, mask= BT_mask[:,None] & BV_mask[None, :])
+            b_v_new = tl.where(BT_mask[:,None] & BV_mask[None, :], b_v_new, 0)
+            b_do = tl.load(p_do, mask= BT_mask[:,None] & BV_mask[None, :])
+            b_do = tl.where(BT_mask[:,None] & BV_mask[None, :], b_do, 0)
+            # [BV, BK]
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            tl.extra.cann.extension.compile_hint(b_h, "mayDiscretememaccess")
+            b_dh = tl.load(p_dh, boundary_check=(0, 1))
+            tl.extra.cann.extension.compile_hint(b_dh, "mayDiscretememaccess")
+            # [BT, BV]
+            b_dv = tl.load(p_dv, mask= BT_mask[:,None] & BV_mask[None, :])
+            tl.extra.cann.extension.compile_hint(b_dv, "mayDiscretememaccess")
+
+            b_dgk += tl.sum(b_h * b_dh, axis=0)
+            b_dq += tl.dot(b_do, b_h.to(b_do.dtype)) * scalar
+            b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype)) * scalar
+            b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype)) * scalar
+            tl.debug_barrier()  # DO NOT REMOVE THIS LINE!
+            if i_k == 0:
+                p_v = v + BT_arange[:, None] * H*V + BV_arange
+                p_dv2_block = tl.make_block_ptr(dv2, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+
+                b_v = tl.load(p_v, mask = BT_mask[:, None] & BV_mask[None, :], other = 0.0)
+
+                b_dA += tl.dot(b_dv, tl.trans(b_v))  * scalar
+
+                b_dvb = tl.dot(b_A, b_dv)
+                b_dv2 = b_dvb * b_beta[:, None]
+                b_db += tl.sum(b_dvb * b_v, 1)
+                casted_b_dv2 = b_dv2.to(p_dv2_block.dtype.element_ty)
+                tl.store(p_dv2_block, casted_b_dv2, boundary_check=(0, 1))
+
+        b_gk_exp = tl.math.exp2(b_g)
+        b_gb = b_gk_exp * b_beta[:, None]
+        b_dgk *= tl.math.exp2(b_gn)
+        b_dq = b_dq * b_gk_exp * scale
+        b_dk = b_dk * tl.where(m_t[:, None], tl.math.exp2(b_gn[None, :] - b_g), 0)
+
+        b_kg = b_k * b_gk_exp
+
+        b_dw = -b_dw.to(b_A.dtype)
+        b_dA += tl.dot(b_dw, tl.trans(b_kg.to(b_A.dtype))) * scalar
+
+        b_dkgb = tl.dot(b_A, b_dw)
+        b_db += tl.sum(b_dkgb * b_kg, 1)
+
+        p_q = tl.make_block_ptr(q, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
+        b_kdk = b_k * b_dk
+        b_dgk += tl.sum(b_kdk, axis=0)
+        b_dg = b_q * b_dq - b_kdk + m_last[:, None] * b_dgk + b_kg * b_dkgb * b_beta[:, None]
+        b_dk = b_dk + b_dkgb * b_gb
+
+        p_dq_block = tl.make_block_ptr(dq, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dk_block = tl.make_block_ptr(dk, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_dg_block = tl.make_block_ptr(dg, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+
+        casted_b_dq = b_dq.to(p_dq_block.dtype.element_ty)
+        tl.store(p_dq_block, casted_b_dq, boundary_check=(0, 1))
+        casted_b_dk = b_dk.to(p_dk_block.dtype.element_ty)
+        tl.store(p_dk_block, casted_b_dk, boundary_check=(0, 1))
+        casted_b_dg = b_dg.to(p_dg_block.dtype.element_ty)
+        tl.store(p_dg_block, casted_b_dg, boundary_check=(0, 1))
+
+    m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
+    b_dA = tl.where(m_A, b_dA * b_beta[None, :], 0)
+    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
+    b_dA = tl.where(m_A, -b_dA, 0)
+
+    p_dA = tl.make_block_ptr(dA, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    p_db = tl.make_block_ptr(db, (T,), (1,), (i_t * BT,), (BT,), (0,))
+    casted_b_dA = b_dA.to(p_dA.dtype.element_ty)
+    tl.store(p_dA, casted_b_dA, boundary_check=(0, 1))
+    casted_b_db = b_db.to(p_db.dtype.element_ty)
+    tl.store(p_db, casted_b_db, boundary_check=(0,))
+
+
+def chunk_kda_bwd_dAv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    do: torch.Tensor,
+    A: torch.Tensor | None = None,
+    scale: float = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, H, K, V = *k.shape, do.shape[-1]
+    BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    # H100 can have larger block size
+    if check_shared_mem('hopper', k.device.index):
+        CONST_TILING = 128
+    elif check_shared_mem:
+        CONST_TILING = 64
+    else:
+        CONST_TILING = 32
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    dA = v.new_empty(B, T, H, BT, dtype=torch.float)
+    dv = torch.empty_like(do)
+    grid = (NT, B * H)
+    chunk_kda_bwd_kernel_dAv[grid](
+        q=q,
+        k=k,
+        v=v,
+        A=A,
+        do=do,
+        dv=dv,
+        dA=dA,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=BK,
+        BV=BV,
     )
+    return dA, dv
 
-    # 3. 计算 roofline gap
-    roofline = compute_roofline_gaps(
-        ncu_top=ncu_top,
-        env=env
+
+def chunk_kda_bwd_wy_dqkg_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    v_new: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    do: torch.Tensor,
+    dh: torch.Tensor,
+    dv: torch.Tensor,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+    transpose_state_layout: bool = False,
+):
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    BT = chunk_size
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    dq = torch.empty_like(q, dtype=torch.float)
+    dk = torch.empty_like(k, dtype=torch.float)
+    dv2 = torch.empty_like(v)
+    dg = torch.empty_like(g, dtype=torch.float)
+    # db = torch.empty_like(beta, dtype=torch.float)
+    # dA = torch.empty_like(A, dtype=torch.float)
+    scalar = 1.0
+
+    stride_hz = B * T
+    beta_t = torch.permute(beta, (2, 0, 1)).contiguous()
+    A_t = torch.permute(A, (2, 0, 1, 3)).contiguous()
+    v_new_t = torch.permute(v_new, (2, 0, 1, 3)).contiguous()
+    do_t = torch.permute(do, (2, 0, 1, 3)).contiguous()
+    q_t = torch.permute(q, (2, 0, 1, 3)).contiguous()
+
+    dA_t = torch.zeros([H, B, T, BT], dtype=torch.float32, device=q.device)
+    db_t = torch.zeros([H, B, T], dtype=torch.float32, device=q.device)
+
+
+    grid = (NT, B * H)
+    chunk_kda_bwd_kernel_wy_dqkg_fused_opt_v2[grid](
+        q=q_t,
+        k=k,
+        v=v,
+        v_new=v_new_t,
+        g=g,
+        beta=beta_t,
+        A=A_t,
+        h=h,
+        do=do_t,
+        dh=dh,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        dv2=dv2,
+        dg=dg,
+        db=db_t,
+        dA=dA_t,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        scale=scale,
+        T=T,
+        scalar=scalar,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        TRANSPOSE_STATE=transpose_state_layout,
+        stride_hz=stride_hz,
     )
+    db = torch.permute(db_t, (1, 2, 0)).contiguous()
+    dA = torch.permute(dA_t, (1, 2, 0, 3)).contiguous()
 
-    # 4. 判断是否接近峰值
-    if roofline.near_peak:
-        break
+    dv = dv2
+    return dq, dk, dv, db, dg, dA
 
-    # 5. 根据 gap 分配优化预算
-    axis_budget = allocate_budget(
-        delta_compute=roofline.delta_compute,
-        delta_memory=roofline.delta_memory,
-        delta_latency=roofline.delta_latency
-    )
 
-    # 6. 根据 profiling 指标选择优化方法
-    methods = select_methods(
-        ncu_metrics=ncu_top,
-        axis_budget=axis_budget,
-        optimization_catalog=catalog,
-        already_tried=state.selected_methods,
-        ineffective=state.ineffective_methods,
-        arch=env.sm_arch
-    )
+    # grid = (NT, B * H)
+    # chunk_kda_bwd_kernel_wy_dqkg_fused[grid](
+    #     q=q,
+    #     k=k,
+    #     v=v,
+    #     v_new=v_new,
+    #     g=g,
+    #     beta=beta,
+    #     A=A,
+    #     h=h,
+    #     do=do,
+    #     dh=dh,
+    #     dq=dq,
+    #     dk=dk,
+    #     dv=dv,
+    #     dv2=dv2,
+    #     dg=dg,
+    #     db=db,
+    #     dA=dA,
+    #     cu_seqlens=cu_seqlens,
+    #     chunk_indices=chunk_indices,
+    #     scale=scale,
+    #     T=T,
+    #     scalar=scalar,
+    #     H=H,
+    #     K=K,
+    #     V=V,
+    #     BT=BT,
+    #     TRANSPOSE_STATE=transpose_state_layout,
+    # )
+    # dv = dv2
+    # return dq, dk, dv, db, dg, dA
 
-    # 7. LLM 生成多个候选 kernel
-    branches = LLM_generate_kernels(
-        best_kernel=best_kernel,
-        methods=methods,
-        variants=[
-            "tile_size",
-            "num_warps",
-            "pipeline_stages",
-            "implementation_variant"
-        ]
-    )
 
-    # 8. 编译、测试、benchmark，选择 champion
-    champion = benchmark_and_select_fastest_correct(branches)
-
-    # 9. 再次 profile champion
-    champion_profile = ncu_profile(champion)
-
-    # 10. 对每个方法做 ablation
-    attribution = ablate_each_method(
-        champion=champion,
-        methods=methods
-    )
-
-    # 11. 做 SASS 验证
-    sass = verify_sass_signatures(
-        champion=champion,
-        methods=methods
-    )
-
-    # 12. 更新状态
-    state.update(
-        best_kernel=champion,
-        roofline=roofline,
-        methods=classify_methods(
-            methods=methods,
-            attribution=attribution,
-            sass=sass
+def chunk_kda_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    Aqk: torch.Tensor,
+    Akk: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    do: torch.Tensor,
+    dht: torch.Tensor,
+    g: torch.Tensor | None = None,
+    g_org: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    disable_recompute: bool = False,
+    cp_context: FLACPContext | None = None,
+    transpose_state_layout: bool = False,
+    **kwargs,
+):
+    if disable_recompute is False:
+        if use_gate_in_kernel:
+            g = kda_gate_chunk_cumsum(
+                g=g_org,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=RCP_LN2,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                lower_bound=lower_bound
+            )
+        w, u, qg, kg = recompute_w_u_fwd(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            A=Akk,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
+        if cp_context is not None:
+            # Restore the full initial_state tensor from the compressed version.
+            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
+            initial_state = expand_h0(initial_state, context=cp_context)
+        h, v_new, _ = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+            transpose_state_layout=transpose_state_layout,
+        )
+    else:
+        w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
+        if cp_context is not None:
+            # Restore the full initial_state tensor from the compressed version.
+            # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
+            initial_state = expand_h0(initial_state, context=cp_context)
+
+    # dAqk = do @ v.T
+    # dv = A @ do
+    dAqk, dv = chunk_kda_bwd_dAv(
+        q=q,
+        k=k,
+        v=v_new,
+        do=do,
+        A=Aqk,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
     )
-```
 
----
-
-## 14. 最核心的数据流
-
-可以进一步压缩为：
-
-```text
-ncu metrics
-    ↓
-compute / memory / latency bottleneck
-    ↓
-roofline gap
-    ↓
-axis budget
-    ↓
-method trigger
-    ↓
-LLM code generation
-    ↓
-benchmark selection
-    ↓
-champion profile
-    ↓
-ablation attribution
-    ↓
-SASS verification
-    ↓
-state update
-```
-
----
-
-## 15. 总结
-
-`cuda-optimized-skill` 中 profiling 的作用可以总结为三点：
-
-### 15.1 决定优化方向
-
-通过 Nsight Compute 指标判断 kernel 当前主要受限于：
-
-```text
-compute
-memory
-latency
-```
-
-### 15.2 约束 LLM 搜索空间
-
-根据 profiling 结果选择具体优化方法，而不是让 LLM 随机尝试。
-
-例如：
-
-```text
-long scoreboard 高 → 尝试 async pipeline
-bank conflict 高 → 优化 shared memory layout
-Tensor Core 利用率低 → 尝试 Tensor Core 路径
-barrier stall 高 → 减少同步
-```
-
-### 15.3 验证优化是否真实有效
-
-通过：
-
-```text
-优化后重新 profile
-ablation benchmark
-SASS verification
-```
-
-判断优化是否真的降低瓶颈、提升速度，并且被编译进机器码。
-
-最终，这个 skill 把 LLM CUDA 优化从：
-
-```text
-凭经验猜优化
-```
-
-变成：
-
-```text
-profiling 证据驱动的闭环搜索
-```
-
-# `ncu_top.json` 和 `roofline.json` 是怎么生成的
-
-在 `cuda-optimized-skill` 中，下面两个文件都是由脚本自动生成的，而不是 LLM 手写出来的：
-
-```text
-iterv1/ncu_top.json
-iterv1/roofline.json
-```
-
-它们的生成关系可以概括为：
-
-```text
-best_input.ncu-rep
-    ↓ profile_ncu.py
-ncu_top.json
-    ↓ roofline.py
-roofline.json
-```
-
-也就是说：
-
-```text
-.ncu-rep:
-    原始完整 Nsight Compute profiling 数据
-
-ncu_top.json:
-    从 .ncu-rep 中提取出的关键指标摘要
-
-roofline.json:
-    根据 ncu_top.json 进一步计算出的优化决策信号
-```
-
----
-
-## 1. `ncu_top.json` 怎么生成
-
-`ncu_top.json` 由脚本生成：
-
-```bash
-scripts/profile_ncu.py
-```
-
-典型运行方式是：
-
-```bash
-python scripts/profile_ncu.py \
-  --state ./run_*/state.json \
-  --iter 1 \
-  --which best_input
-```
-
-它的流程如下：
-
-```text
-读取 state.json
-    ↓
-找到当前 best kernel
-    ↓
-调用 ncu --set full 跑 Nsight Compute
-    ↓
-生成 best_input.ncu-rep
-    ↓
-使用 ncu --import 将 .ncu-rep 导出成 CSV
-    ↓
-解析 CSV 中的 metrics
-    ↓
-按照规则把 metrics 分成 compute / memory / latency 三类
-    ↓
-每类选择 top-K 最关键指标
-    ↓
-写出 ncu_top.json
-```
-
----
-
-## 2. `profile_ncu.py` 具体做了什么
-
-`profile_ncu.py` 的核心作用是：
-
-```text
-完整 NCU profile
-    → CSV metrics
-    → 指标分类
-    → 严重程度排序
-    → top-K 指标摘要
-```
-
-它会把指标分成三类。
-
-### 2.1 Compute 轴
-
-关注计算资源是否被充分利用，例如：
-
-```text
-Tensor Core utilization
-FP32 / FP64 pipe utilization
-IPC
-occupancy
-SM throughput
-```
-
-### 2.2 Memory 轴
-
-关注访存是否高效，例如：
-
-```text
-DRAM throughput
-DRAM bytes
-L1 / L2 hit rate
-shared memory bank conflicts
-L1 / L2 throughput
-```
-
-### 2.3 Latency 轴
-
-关注 stall 和等待，例如：
-
-```text
-long scoreboard stall
-short scoreboard stall
-barrier stall
-mio throttle
-lg throttle
-wait stall
-```
-
-最终生成的 `ncu_top.json` 可以理解成：
-
-```json
-{
-  "compute": [
-    {
-      "name": "sm__pipe_tensor_op_hmma_cycles_active...",
-      "value": 12.3
-    },
-    {
-      "name": "sm__warps_active...",
-      "value": 18.0
-    }
-  ],
-  "memory": [
-    {
-      "name": "dram__throughput...",
-      "value": 35.2
-    },
-    {
-      "name": "l1tex__t_sector_hit_rate.pct",
-      "value": 22.1
-    }
-  ],
-  "latency": [
-    {
-      "name": "smsp__warp_issue_stalled_long_scoreboard...",
-      "value": 41.0
-    }
-  ]
-}
-```
-
-这里的 `ncu_top.json` 不是完整 profile，而是给 LLM 和后续脚本使用的 profiling 摘要。
-
----
-
-## 3. `roofline.json` 怎么生成
-
-`roofline.json` 由另一个脚本生成：
-
-```bash
-scripts/roofline.py
-```
-
-典型运行方式是：
-
-```bash
-python scripts/roofline.py \
-  --state ./run_*/state.json \
-  --iter 1
-```
-
-它读取：
-
-```text
-iterv1/ncu_top.json
-env.json / state.json 中的硬件环境信息
-```
-
-然后计算三个 gap：
-
-```text
-Δc = delta_compute
-Δm = delta_memory
-Δl = delta_latency
-```
-
----
-
-## 4. `roofline.py` 的核心计算逻辑
-
-`roofline.py` 会把 `ncu_top.json` 中的指标进一步压缩成三个优化方向的 gap。
-
-### 4.1 Compute gap
-
-粗略可以理解为：
-
-```python
-compute_util = max(
-    tensor_core_utilization,
-    fp32_pipe_utilization,
-    sm_throughput
-)
-
-delta_compute = 1 - compute_util
-```
-
-含义是：
-
-```text
-compute utilization 越低，delta_compute 越大；
-delta_compute 越大，说明计算资源利用越不充分。
-```
-
----
-
-### 4.2 Memory gap
-
-粗略可以理解为：
-
-```python
-memory_util = dram_throughput_pct
-delta_memory = 1 - memory_util
-```
-
-含义是：
-
-```text
-memory bandwidth utilization 越低，delta_memory 越大；
-delta_memory 越大，说明访存带宽利用不足或存在访存瓶颈。
-```
-
----
-
-### 4.3 Latency gap
-
-粗略可以理解为：
-
-```python
-delta_latency = max(stall_percentage_metrics)
-```
-
-它会关注一些 stall 指标，例如：
-
-```text
-long scoreboard stall
-short scoreboard stall
-barrier stall
-mio throttle
-lg throttle
-wait stall
-```
-
-含义是：
-
-```text
-stall 百分比越高，delta_latency 越大；
-delta_latency 越大，说明 kernel 中有较严重的等待或延迟问题。
-```
-
----
-
-## 5. `roofline.json` 中会包含什么
-
-`roofline.json` 通常会包含：
-
-```json
-{
-  "delta_compute": 0.85,
-  "delta_memory": 0.60,
-  "delta_latency": 0.55,
-  "bound": "compute",
-  "near_peak": false,
-  "axis_budget": {
-    "compute": 1,
-    "memory": 1,
-    "latency": 1
-  }
-}
-```
-
-这些字段的含义是：
-
-| 字段              | 含义                     |
-| --------------- | ---------------------- |
-| `delta_compute` | 计算资源利用 gap             |
-| `delta_memory`  | 访存带宽利用 gap             |
-| `delta_latency` | stall / latency gap    |
-| `bound`         | 当前主要瓶颈方向               |
-| `near_peak`     | 是否已经接近硬件峰值             |
-| `axis_budget`   | 下一轮每个优化轴可以选择多少个 method |
-
----
-
-## 6. 如何判断主要瓶颈
-
-可以简单理解为：
-
-```text
-如果 delta_compute 最大
-    → compute-bound
-
-如果 delta_memory 最大
-    → bandwidth-bound / memory-bound
-
-如果 delta_latency 最大
-    → latency-bound
-
-如果三个 gap 都很小
-    → near_peak = true
-```
-
-例如：
-
-```json
-{
-  "delta_compute": 0.92,
-  "delta_memory": 0.57,
-  "delta_latency": 0.61,
-  "bound": "compute",
-  "near_peak": false
-}
-```
-
-表示：
-
-```text
-compute gap 最大；
-当前 kernel 主要问题是计算资源利用率低；
-下一轮应该优先尝试 compute 相关优化。
-```
-
----
-
-## 7. 如何分配 axis budget
-
-`roofline.py` 会根据三个 gap 分配下一轮优化预算。
-
-可以理解为：
-
-```text
-总 budget = 3
-单个 axis 最多 = 2
-gap 太小的 axis 分配 0
-按照 delta_compute / delta_memory / delta_latency 的相对大小分配预算
-```
-
-例如：
-
-```json
-{
-  "delta_compute": 0.20,
-  "delta_memory": 0.75,
-  "delta_latency": 0.55,
-  "axis_budget": {
-    "compute": 0,
-    "memory": 2,
-    "latency": 1
-  }
-}
-```
-
-表示：
-
-```text
-memory gap 最大，因此 memory 轴分配 2 个 method；
-latency gap 次之，因此 latency 轴分配 1 个 method；
-compute gap 较小，因此 compute 轴暂时不分配 method。
-```
-
----
-
-## 8. 两个文件的作用区别
-
-| 文件                   | 来源               | 作用                |
-| -------------------- | ---------------- | ----------------- |
-| `best_input.ncu-rep` | Nsight Compute   | 保存完整 profiling 结果 |
-| `ncu_top.json`       | `profile_ncu.py` | 从 NCU 结果中提取关键指标   |
-| `roofline.json`      | `roofline.py`    | 根据关键指标计算优化方向和预算   |
-
-可以进一步理解为：
-
-```text
-best_input.ncu-rep:
-    原始数据层
-
-ncu_top.json:
-    profiling 摘要层
-
-roofline.json:
-    优化决策层
-```
-
----
-
-## 9. 程序化总结
-
-整个过程可以写成：
-
-```python
-# 1. 跑 Nsight Compute，得到完整 profile
-ncu_rep = run_nsight_compute(best_kernel)
-
-# 2. 从完整 profile 中提取关键指标
-ncu_top = extract_top_metrics(
-    ncu_rep,
-    axes=["compute", "memory", "latency"]
-)
-
-# 3. 根据关键指标计算 roofline gap
-roofline = compute_roofline_gaps(
-    ncu_top=ncu_top,
-    env_info=env
-)
-
-# 4. 根据 gap 分配优化预算
-axis_budget = allocate_method_budget(
-    delta_compute=roofline["delta_compute"],
-    delta_memory=roofline["delta_memory"],
-    delta_latency=roofline["delta_latency"]
-)
-```
-
----
-
-## 10. 最终总结
-
-这两个文件的生成逻辑可以一句话概括：
-
-```text
-profile_ncu.py 负责把完整 NCU profile 压缩成 ncu_top.json；
-roofline.py 负责把 ncu_top.json 转换成 roofline.json，用来指导下一轮优化。
-```
-
-也就是说：
-
-```text
-profiling 原始数据
-    ↓
-关键指标摘要
-    ↓
-compute / memory / latency gap
-    ↓
-axis budget
-    ↓
-method selection
-    ↓
-LLM code generation
-```
-
+    if cp_context is not None:
+        # initial_state is None in the CP mode
+        # We only need to compute dht of current rank and pass it to the backward kernel
+        dht, initial_state = chunk_gated_delta_rule_bwd_dhu_pre_process(
+            q=qg,
+            k=kg,
+            w=w,
+            do=do,
+            dv=dv,
+            gk=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            dht=dht,
+            initial_state=initial_state,
+            use_exp2=True,
+            context=cp_context,
+            transpose_state_layout=transpose_state_layout,
+        )
+
+    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
+        q=qg,
+        k=kg,
+        w=w,
+        gk=g,
+        h0=initial_state,
+        dht=dht,
+        do=do,
+        dv=dv,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+        transpose_state_layout=transpose_state_layout,
+    )
+
+    dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
+        q=q,
+        k=k,
+        v=v,
+        v_new=v_new,
+        g=g,
+        beta=beta,
+        A=Akk,
+        h=h,
+        do=do,
+        dh=dh,
+        dv=dv,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        transpose_state_layout=transpose_state_layout,
+    )
+
+    dq, dk, db, dg = chunk_kda_bwd_intra(
+        q=q,
+        k=k,
+        g=g,
+        beta=beta,
+        dAqk=dAqk,
+        dAkk=dAkk,
+        dq=dq,
+        dk=dk,
+        db=db,
+        dg=dg,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
+        safe_gate=safe_gate
+    )
+
+    dA, dbias = None, None
+    dg = chunk_local_cumsum(
+        dg,
+        chunk_size=chunk_size,
+        reverse=True,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    if use_gate_in_kernel:
+        dg, dA, dbias = kda_gate_bwd(
+            g=g_org,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            dyg=dg,
+            lower_bound=lower_bound
+        )
+
+    return dq, dk, dv, db, dg, dh0, dA, dbias
